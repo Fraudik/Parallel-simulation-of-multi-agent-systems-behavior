@@ -4,7 +4,8 @@ import gc
 import time
 import numpy.random as random
 
-from base_baseline_algorithn import run_baseline_simulation
+from baseline_algorithms.base_baseline_algorithn import run_baseline_simulation
+from config import SIMULATION_TIMEOUT
 from ipc_utilities import AnnotatedMovement, work, deserialize_base_movements, serialize_base_movements, \
     request_base_movement_calculation
 from logging_manager import logger
@@ -15,7 +16,8 @@ import gevent.queue
 import gipc
 
 from snakes.nets import *
-from nets_generator import *
+
+from benchmark_utilities.nets_generator import *
 
 # net is loaded globally to make it available for all processes, and it costs to load it on every calculation
 net = load_from_file('nets.pnml')
@@ -69,9 +71,8 @@ class WorkersManager:
 def calculate_movement(transition_repr, marking_repr):
     net.set_marking(eval(marking_repr))
     t = net.transition(eval(transition_repr))
-    # there is maximum only one movement can be available for basic Petri Net,
-    # but SNAKES library is made for different sorts of Petri nets with possibly many movements and thus return list
-    return [AnnotatedMovement(*t.flow(m)) for m in t.modes()]
+    # Returning tuple for value unpacking and compatibility with workflow algorithm (see ipc_utilities.work)
+    return ([AnnotatedMovement(*t.flow(m)) for m in t.modes()],)
 
 
 class HandlerStates(enum.Enum):
@@ -178,7 +179,6 @@ class TransitionHandler:
         return False
 
     def activate_transition(self):
-        coroutines_to_enqueue = gevent.pool.Group()
         self.state = HandlerStates.ENQUEUED
 
         logger.debug(f"{self}: CALCULATING MOVEMENT")
@@ -193,25 +193,26 @@ class TransitionHandler:
         if not can_perform_movement and self.state == HandlerStates.TO_RETRY:
             logger.debug(f"{self}: RETRYING")
             g = gevent.spawn(self.activate_transition)
-            coroutines_to_enqueue.add(g)
+            coroutines_to_enqueue.put(g)
         elif not can_perform_movement:
             logger.debug(f"{self}: STALE")
             self.state = HandlerStates.STALE
         else:
-            self.state = HandlerStates.STALE
             # here name passed for logging and statistics purposes only
             self.simulation_manager.perform_movement(self.name, calculated_movement)
 
+            coroutines_to_enqueue.put(gevent.spawn(self.activate_transition))
+
             # shuffle for purposes of fairness
             # Python set can not be shuffled and also is not purely random shuffled itself
-            other_handlers = list(self.concurrent_handlers.union(self.consuming_handlers))
+            other_handlers = list(self.consuming_handlers)
             random.shuffle(other_handlers)
             for other_handler in other_handlers:
                 if other_handler.state == HandlerStates.STALE:
                     logger.debug(f"{self} => enqueue {other_handler.name}")
                     other_handler.state = HandlerStates.ENQUEUED
                     g = gevent.spawn(other_handler.activate_transition)
-                    coroutines_to_enqueue.add(g)
+                    coroutines_to_enqueue.put(g)
                 elif other_handler.state == HandlerStates.ENQUEUED:
                     if other_handler in self.consuming_handlers:
                         logger.debug(f"{self} => to retry {other_handler.name}")
@@ -223,13 +224,13 @@ if __name__ == "__main__":
     pids = []
     pipes_queue = gevent.queue.UnboundQueue()
     procs_with_pipes = []
-    timeout = 5
     compare_with_baseline_algorithm = False
+    coroutines_to_enqueue = gevent.queue.UnboundQueue()
 
     workers_manager = WorkersManager(serialize_base_movements, deserialize_base_movements)
     workers_manager.create_pool(10)
     manager = SimulationManager(workers_manager, net)
-    gevent_timeout = gevent.Timeout(timeout)
+    gevent_timeout = gevent.Timeout(SIMULATION_TIMEOUT)
     gevent_timeout.start()
     try:
         transition_processors = manager.build()
@@ -242,14 +243,11 @@ if __name__ == "__main__":
 
         manager.print_stats()
         # manager.print_stats_for_benchmarks()
-        # Suppressing errors from interrupted greenlets, because with gracefully shutdown they do not stop
+        # Suppressing errors from interrupted threads, because they can interpret stopping as OSError
         sys.stderr = DevNull()
-        gevent.killall(
-            [obj for obj in gc.get_objects() if isinstance(obj, gevent.Greenlet)]
-        )
         workers_manager.destroy_pool()
 
         if compare_with_baseline_algorithm:
-            run_baseline_simulation(timeout=timeout)
+            run_baseline_simulation(timeout=SIMULATION_TIMEOUT)
 
         sys.exit(0)

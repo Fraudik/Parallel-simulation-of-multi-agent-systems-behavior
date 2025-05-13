@@ -10,16 +10,17 @@ import gevent.queue
 import gipc
 import numpy.random as random
 
-from constraint_generator import generate_formula
+from config import SIMULATION_TIMEOUT
 from constraints_evaluation import CheckActivationValidity, constraint_parser
-from ipc_utilities import AnnotatedMovement, serialize_base_movements, deserialize_base_movements, work, \
+from ipc_utilities import AnnotatedMovement, work, \
     request_workflow_movement_calculation, serialize_workflow_movements, deserialize_workflow_movements
 from logging_manager import logger
-from nets_generator import *
+from benchmark_utilities.nets_generator import load_from_file
+from benchmark_utilities.constraint_generator import generate_formula
 
 from snakes.nets import *
 
-from workflow_baseline_algorithm import run_baseline_simulation
+from baseline_algorithms.workflow_baseline_algorithm import run_baseline_simulation
 
 # net is loaded globally to make it available for all processes, and it costs to load it on every calculation
 net = load_from_file('nets.pnml')
@@ -163,7 +164,8 @@ class SimulationManager:
 
     def print_stats_for_benchmarks(self):
         simulation_time = time.time() - self.simulation_start
-        logger.info(f"{self.events_count / simulation_time}")
+        building_time = self.simulation_start - self.building_start
+        logger.info(f"{self.events_count / (simulation_time - building_time)}")
         return self.events_count / simulation_time
 
     def perform_movement(self, transition_name, movement: AnnotatedMovement):
@@ -204,10 +206,16 @@ class TransitionHandler:
         return False
 
     def activate_transition(self):
-        coroutines_to_enqueue = gevent.pool.Group()
         self.state = HandlerStates.ENQUEUED
-
         logger.debug(f"{self}: CALCULATING MOVEMENT")
+
+        # t = net.transition(self.name)
+        # movements = [AnnotatedMovement(*t.flow(m)) for m in t.modes()]
+        # if not movements:
+        #     logger.debug(f"{self}: stale")
+        #     self.state = HandlerStates.STALE
+        #     return
+
         calculated_movement, possibly_enabled, possible_disabled = request_workflow_movement_calculation(self.calculation_manager,
                                                                              self.name,
                                                                              self.simulation_manager.current_marking,
@@ -221,17 +229,18 @@ class TransitionHandler:
                 (not can_perform_movement and self.state == HandlerStates.POSSIBLY_ENABLED)):
             logger.debug(f"{self}: possibly disabled, retrying")
             cor = gevent.spawn(self.activate_transition)
-            coroutines_to_enqueue.add(cor)
+            coroutines_to_enqueue.put(cor)
         elif not can_perform_movement:
             logger.debug(f"{self}: stale")
             self.state = HandlerStates.STALE
         else:
-            self.state = HandlerStates.STALE
             self.simulation_manager.perform_movement(self.name, calculated_movement)
+
+            coroutines_to_enqueue.put(gevent.spawn(self.activate_transition))
 
             # shuffle for purposes of fairness
             # Python set can not be shuffled and also is not purely random shuffled itself
-            other_handlers = list(self.concurrent_handlers | self.consuming_handlers | set(possibly_enabled))
+            other_handlers = list(self.consuming_handlers | set(possibly_enabled))
             random.shuffle(other_handlers)
             for handler_name in other_handlers:
                 handler = self.simulation_manager.transitions_mapping[handler_name]
@@ -239,8 +248,8 @@ class TransitionHandler:
                     logger.debug(f"{self} => enqueue {handler.name}")
                     handler.state = HandlerStates.ENQUEUED
                     cor = gevent.spawn(handler.activate_transition)
-                    coroutines_to_enqueue.add(cor)
-                elif handler_name not in self.concurrent_handlers and handler.state == HandlerStates.ENQUEUED:
+                    coroutines_to_enqueue.put(cor)
+                elif handler.state == HandlerStates.ENQUEUED:
                     logger.debug(f"{self} => possibly enabled {handler.name}")
                     handler.state = HandlerStates.POSSIBLY_ENABLED
 
@@ -255,42 +264,40 @@ class TransitionHandler:
 
 
 if __name__ == "__main__":
-    # должны быть глобальными из-за особенностей gipc с процессами и пайпами
     pids = []
     pipes_queue = gevent.queue.UnboundQueue()
     procs_with_pipes = []
-    timeout = 3
+    # TODO move to config?
     compare_with_baseline_algorithm = True
+    coroutines_to_enqueue = gevent.queue.UnboundQueue()
 
     variables = [t for t in net.transition()]
     length = int(sys.argv[1])
     constraint_formula = generate_formula(variables, length)
 
     workers_manager = WorkersManager(serialize_workflow_movements, deserialize_workflow_movements)
+    # TODO move to config
     workers_manager.create_pool(10)
     manager = SimulationManager(workers_manager, net, constraint_formula)
-    gevent_timeout = gevent.Timeout(timeout)
+    gevent_timeout = gevent.Timeout(SIMULATION_TIMEOUT)
     gevent_timeout.start()
     try:
         transition_handlers = manager.build()
         logger.debug("start simulation for %r" % net.name)
         manager.startup(transition_handlers)
     finally:
+        # manager.print_stats()
+        manager.print_stats_for_benchmarks()
+
         class DevNull:
             def write(self, msg):
                 pass
 
-
-        # manager.print_stats()
-        manager.print_stats_for_benchmarks()
-        # Suppressing errors from interrupted greenlets, because with gracefully shutdown they do not stop
+        # Suppressing errors from interrupted threads, because they can interpret stopping as OSError
         sys.stderr = DevNull()
-        gevent.killall(
-            [obj for obj in gc.get_objects() if isinstance(obj, gevent.Greenlet)]
-        )
         workers_manager.destroy_pool()
 
         if compare_with_baseline_algorithm:
-            run_baseline_simulation(constraint_formula=constraint_formula, timeout=timeout)
+            run_baseline_simulation(constraint_formula=constraint_formula, timeout=SIMULATION_TIMEOUT)
 
-        sys.exit(0)
+        # sys.exit(0)

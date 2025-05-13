@@ -1,8 +1,9 @@
 import logging
 import sys
 
-# TODO path to global
-logging.basicConfig(filename="benchs/data/experiment.txt",
+from config import PROPOSED_BENCH_FILE_PATH
+
+logging.basicConfig(filename=PROPOSED_BENCH_FILE_PATH,
                     filemode='a',
                     format='%(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S',

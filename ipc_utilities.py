@@ -2,7 +2,6 @@ import typing
 
 from snakes.nets import *
 
-
 def work(task_function, serialize_function, pipe):
     """
     A function that is called to request calculations from workers.
@@ -53,6 +52,7 @@ def request_base_movement_calculation(workers_manager_, transition, marking):
     movements = workers_manager_.process_task(repr(transition), repr(marking))
     if len(movements) == 0:
         return None
+    # For purposes of compatibility
     return movements[0]
 
 
