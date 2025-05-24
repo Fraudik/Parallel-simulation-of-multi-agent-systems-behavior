@@ -1,21 +1,19 @@
 import collections
 import enum
-import gc
 import time
 import numpy.random as random
 
 from baseline_algorithms.base_baseline_algorithn import run_baseline_simulation
-from config import SIMULATION_TIMEOUT
-from ipc_utilities import AnnotatedMovement, work, deserialize_base_movements, serialize_base_movements, \
-    request_base_movement_calculation
+from config import SIMULATION_TIMEOUT, WORKERS_NUM, IS_COMPARING_WITH_BASELINE_ALGORITHM, IS_DEBUG, IS_BENCHMARKING
+from ipc_utilities import AnnotatedMovement, deserialize_base_movements, serialize_base_movements, \
+    request_base_movement_calculation, WorkersManager
 from logging_manager import logger
 import gevent
 import gevent.event
 import gevent.pool
 import gevent.queue
-import gipc
 
-from snakes.nets import *
+from snakes.nets import *   # noqa
 
 from benchmark_utilities.nets_generator import *
 
@@ -23,56 +21,11 @@ from benchmark_utilities.nets_generator import *
 net = load_from_file('nets.pnml')
 
 
-class WorkersManager:
-    """
-    Workers manager for performing CPU-bound tasks (each worker is a process)
-    """
-
-    def __init__(self, serialization_fun, deserialization_fun):
-        self.serialization_fun = serialization_fun
-        self.deserialization_fun = deserialization_fun
-
-    def create_pool(self, count):
-        for worker_num in range(count):
-            one, two = gipc.pipe(True)
-            proc = gipc.start_process(target=work, args=(calculate_movement, self.serialization_fun, one))
-            pids.append(proc.pid)
-            pipes_queue.put(two)
-            procs_with_pipes.append((proc, two))
-
-    def destroy_pool(self):
-        for proc, pipe in procs_with_pipes:
-            try:
-                pipe.close()
-            except:
-                pass
-            try:
-                proc.terminate()
-            except:
-                pass
-
-    def process_task(self, *args, **kwargs):
-        pipe = pipes_queue.get()
-        try:
-            pipe.put((args, kwargs))
-        except:
-            return []
-        try:
-            resp = self.deserialization_fun(pipe.get())
-        except:
-            return []
-        pipes_queue.put(pipe)
-        if isinstance(resp, Exception):
-            return []
-        else:
-            return resp
-
-
 def calculate_movement(transition_repr, marking_repr):
     net.set_marking(eval(marking_repr))
     t = net.transition(eval(transition_repr))
     # Returning tuple for value unpacking and compatibility with workflow algorithm (see ipc_utilities.work)
-    return ([AnnotatedMovement(*t.flow(m)) for m in t.modes()],)
+    return [AnnotatedMovement(*t.flow(m)) for m in t.modes()],
 
 
 class HandlerStates(enum.Enum):
@@ -123,8 +76,9 @@ class SimulationManager:
         self.simulation_start = time.time()
 
         handlers_coroutines = gevent.pool.Group()
-        # no need to shuffle them, as we enqueue each handler exactly one time
-        for t in transitions:
+        shuffled_transitions = list(transitions)
+        random.shuffle(shuffled_transitions)
+        for t in shuffled_transitions:
             t.state = HandlerStates.ENQUEUED
             g = gevent.spawn(t.activate_transition)
             handlers_coroutines.add(g)
@@ -133,7 +87,7 @@ class SimulationManager:
     def print_stats(self):
         simulation_time = time.time() - self.simulation_start
         building_time = self.simulation_start - self.building_start
-        logger.info(f"{len(pids)} workers, {building_time}s building overhead, "
+        logger.info(f"{building_time}s building overhead, "
                     f"{self.events_count} / {simulation_time} = {self.events_count / simulation_time} events per second")
         logger.info(f"Transition handlers distribution: {self.events_distribution}")
 
@@ -221,14 +175,13 @@ class TransitionHandler:
 
 
 if __name__ == "__main__":
-    pids = []
-    pipes_queue = gevent.queue.UnboundQueue()
-    procs_with_pipes = []
-    compare_with_baseline_algorithm = False
+    compare_with_baseline_algorithm = IS_COMPARING_WITH_BASELINE_ALGORITHM
     coroutines_to_enqueue = gevent.queue.UnboundQueue()
 
-    workers_manager = WorkersManager(serialize_base_movements, deserialize_base_movements)
-    workers_manager.create_pool(10)
+    workers_manager = WorkersManager(calculate_movement_fun=calculate_movement,
+                                     serialization_fun=serialize_base_movements,
+                                     deserialization_fun=deserialize_base_movements)
+    workers_manager.create_pool(WORKERS_NUM)
     manager = SimulationManager(workers_manager, net)
     gevent_timeout = gevent.Timeout(SIMULATION_TIMEOUT)
     gevent_timeout.start()
@@ -237,17 +190,18 @@ if __name__ == "__main__":
         logger.debug("start simulation for %r" % net.name)
         manager.startup(transition_processors)
     finally:
+        if IS_BENCHMARKING:
+            manager.print_stats_for_benchmarks()
+        else:
+            manager.print_stats()
+
         class DevNull:
             def write(self, msg):
                 pass
 
-        manager.print_stats()
-        # manager.print_stats_for_benchmarks()
         # Suppressing errors from interrupted threads, because they can interpret stopping as OSError
         sys.stderr = DevNull()
         workers_manager.destroy_pool()
 
         if compare_with_baseline_algorithm:
             run_baseline_simulation(timeout=SIMULATION_TIMEOUT)
-
-        sys.exit(0)

@@ -6,7 +6,7 @@ from benchmark_utilities.nets_generator import load_from_file
 
 
 def run_baseline_simulation(timeout: int):
-    net = load_from_file('../nets.pnml')
+    net = load_from_file('nets.pnml')
 
     def _calculate_movement(_transition):
         movements = [AnnotatedMovement(*_transition.flow(m)) for m in _transition.modes()]

@@ -1,24 +1,23 @@
 import collections
 import enum
-import gc
+import sys
 import time
 
 import gevent
 import gevent.event
 import gevent.pool
 import gevent.queue
-import gipc
 import numpy.random as random
 
-from config import SIMULATION_TIMEOUT
+from config import SIMULATION_TIMEOUT, IS_COMPARING_WITH_BASELINE_ALGORITHM, WORKERS_NUM, IS_DEBUG, IS_BENCHMARKING
 from constraints_evaluation import CheckActivationValidity, constraint_parser
-from ipc_utilities import AnnotatedMovement, work, \
-    request_workflow_movement_calculation, serialize_workflow_movements, deserialize_workflow_movements
+from ipc_utilities import AnnotatedMovement, \
+    request_workflow_movement_calculation, serialize_workflow_movements, deserialize_workflow_movements, WorkersManager
 from logging_manager import logger
 from benchmark_utilities.nets_generator import load_from_file
 from benchmark_utilities.constraint_generator import generate_formula
 
-from snakes.nets import *
+from snakes.nets import *   # noqa
 
 from baseline_algorithms.workflow_baseline_algorithm import run_baseline_simulation
 
@@ -26,57 +25,10 @@ from baseline_algorithms.workflow_baseline_algorithm import run_baseline_simulat
 net = load_from_file('nets.pnml')
 
 
-class WorkersManager:
-    """
-    Workers manager for performing CPU-bound tasks (each worker is a process)
-    """
-
-    def __init__(self, serialization_fun, deserialization_fun):
-        self.serialization_fun = serialization_fun
-        self.deserialization_fun = deserialization_fun
-
-    def create_pool(self, count):
-        for worker_num in range(count):
-            one, two = gipc.pipe(True)
-            proc = gipc.start_process(target=work, args=(calculate_movement, self.serialization_fun, one))
-            pids.append(proc.pid)
-            pipes_queue.put(two)
-            procs_with_pipes.append((proc, two))
-
-    def destroy_pool(self):
-        for proc, pipe in procs_with_pipes:
-            try:
-                pipe.close()
-            except:
-                pass
-            try:
-                proc.terminate()
-            except:
-                pass
-
-    def process_task(self, *args, **kwargs):
-        pipe = pipes_queue.get()
-        try:
-            pipe.put((args, kwargs))
-        except:
-            return []
-        try:
-            resp = self.deserialization_fun(*pipe.get())
-        except:
-            return []
-        pipes_queue.put(pipe)
-        if isinstance(resp, Exception):
-            return []
-        else:
-            return resp
-
-
-def calculate_movement(transition_repr, marking_repr, trace, constraint_formula_):
-    # TODO add docstring
-
+def calculate_movement_in_workflow_net(transition_repr, marking_repr, trace, constraint_formula_):
     net.set_marking(eval(marking_repr))
     t = net.transition(eval(transition_repr))
-    # TODO - possible optimization is to check available movement before calling calculate movement
+    # Running more lightweight check first
     movements = [AnnotatedMovement(*t.flow(m)) for m in t.modes()]
     if not movements:
         return [], [], []
@@ -145,8 +97,9 @@ class SimulationManager:
         self.simulation_start = time.time()
 
         handlers_coroutines = gevent.pool.Group()
-        # TODO add random?
-        for t in transitions:
+        shuffled_transitions = list(transitions)
+        random.shuffle(shuffled_transitions)
+        for t in shuffled_transitions:
             t.state = HandlerStates.ENQUEUED
             g = gevent.spawn(t.activate_transition)
             handlers_coroutines.add(g)
@@ -157,15 +110,14 @@ class SimulationManager:
         building_time = self.simulation_start - self.building_start
         logger.info(f"Constraint formula: {self.constraint_formula}")
         logger.info(f"Simulation trace: {self.trace}")
-        logger.info(f"{len(pids)} workers, {building_time}s building overhead, "
+        logger.info(f"{building_time}s building overhead, "
                     f"{self.events_count} / {simulation_time} = {self.events_count / simulation_time} events per second")
         logger.info(f"Transition handlers distribution: {self.events_distribution}")
         return self.events_count / simulation_time
 
     def print_stats_for_benchmarks(self):
         simulation_time = time.time() - self.simulation_start
-        building_time = self.simulation_start - self.building_start
-        logger.info(f"{self.events_count / (simulation_time - building_time)}")
+        logger.info(f"{self.events_count / simulation_time}")
         return self.events_count / simulation_time
 
     def perform_movement(self, transition_name, movement: AnnotatedMovement):
@@ -208,13 +160,6 @@ class TransitionHandler:
     def activate_transition(self):
         self.state = HandlerStates.ENQUEUED
         logger.debug(f"{self}: CALCULATING MOVEMENT")
-
-        # t = net.transition(self.name)
-        # movements = [AnnotatedMovement(*t.flow(m)) for m in t.modes()]
-        # if not movements:
-        #     logger.debug(f"{self}: stale")
-        #     self.state = HandlerStates.STALE
-        #     return
 
         calculated_movement, possibly_enabled, possible_disabled = request_workflow_movement_calculation(self.calculation_manager,
                                                                              self.name,
@@ -264,20 +209,17 @@ class TransitionHandler:
 
 
 if __name__ == "__main__":
-    pids = []
-    pipes_queue = gevent.queue.UnboundQueue()
-    procs_with_pipes = []
-    # TODO move to config?
-    compare_with_baseline_algorithm = True
+    compare_with_baseline_algorithm = IS_COMPARING_WITH_BASELINE_ALGORITHM
     coroutines_to_enqueue = gevent.queue.UnboundQueue()
 
     variables = [t for t in net.transition()]
     length = int(sys.argv[1])
     constraint_formula = generate_formula(variables, length)
 
-    workers_manager = WorkersManager(serialize_workflow_movements, deserialize_workflow_movements)
-    # TODO move to config
-    workers_manager.create_pool(10)
+    workers_manager = WorkersManager(calculate_movement_fun=calculate_movement_in_workflow_net,
+                                     serialization_fun=serialize_workflow_movements,
+                                     deserialization_fun=deserialize_workflow_movements)
+    workers_manager.create_pool(WORKERS_NUM)
     manager = SimulationManager(workers_manager, net, constraint_formula)
     gevent_timeout = gevent.Timeout(SIMULATION_TIMEOUT)
     gevent_timeout.start()
@@ -286,8 +228,10 @@ if __name__ == "__main__":
         logger.debug("start simulation for %r" % net.name)
         manager.startup(transition_handlers)
     finally:
-        # manager.print_stats()
-        manager.print_stats_for_benchmarks()
+        if IS_BENCHMARKING:
+            manager.print_stats_for_benchmarks()
+        else:
+            manager.print_stats()
 
         class DevNull:
             def write(self, msg):
@@ -299,5 +243,3 @@ if __name__ == "__main__":
 
         if compare_with_baseline_algorithm:
             run_baseline_simulation(constraint_formula=constraint_formula, timeout=SIMULATION_TIMEOUT)
-
-        # sys.exit(0)

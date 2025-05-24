@@ -1,0 +1,7 @@
+gevent==24.10.3
+gipc==1.7.0
+lark==1.2.2
+numpy==1.26.4
+matplotlib==3.8.0
+snakes==0.9.33
+networkx==3.1

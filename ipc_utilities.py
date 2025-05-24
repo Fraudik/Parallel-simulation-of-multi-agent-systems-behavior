@@ -1,6 +1,51 @@
 import typing
 
-from snakes.nets import *
+import gevent.queue
+from gipc import gipc
+from snakes.nets import *   # noqa
+
+
+class WorkersManager:
+    """
+    Workers manager for performing CPU-bound tasks (each worker is a process)
+    """
+
+    def __init__(self, calculate_movement_fun, serialization_fun, deserialization_fun):
+        self.serialization_fun = serialization_fun
+        self.deserialization_fun = deserialization_fun
+        self.calculate_movement_fun = calculate_movement_fun
+
+        self.procs_with_pipes = []
+        self.pipes_queue = gevent.queue.UnboundQueue()
+
+    def create_pool(self, count):
+        for worker_num in range(count):
+            one, two = gipc.pipe(True)
+            proc = gipc.start_process(target=work, args=(self.calculate_movement_fun, self.serialization_fun, one))
+            self.pipes_queue.put(two)
+            self.procs_with_pipes.append((proc, two))
+
+    def destroy_pool(self):
+        for proc, pipe in self.procs_with_pipes:
+            try:
+                pipe.close()
+            except:
+                pass
+            try:
+                proc.terminate()
+            except:
+                pass
+
+    def process_task(self, *args, **kwargs):
+        pipe = self.pipes_queue.get()
+        pipe.put((args, kwargs))
+        resp = self.deserialization_fun(*pipe.get())
+        self.pipes_queue.put(pipe)
+        if isinstance(resp, Exception):
+            return []
+        else:
+            return resp
+
 
 def work(task_function, serialize_function, pipe):
     """
@@ -37,7 +82,8 @@ def serialize_base_movements(movements_to_pipe: typing.List[AnnotatedMovement]):
     movements_repr = []
     for i in movements_to_pipe:
         movements_repr.append((repr(i.start_places), repr(i.end_places)))
-    return movements_repr
+    # Returning tuple for compatibility (unpacking)
+    return movements_repr,
 
 
 def deserialize_base_movements(movements_from_pipe: typing.List[str]):
